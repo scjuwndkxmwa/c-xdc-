@@ -15,7 +15,7 @@ TIKTOK_URL = os.getenv(
 
 YOUTUBE_RTMP = os.getenv(
     "YOUTUBE_RTMP",
-    "rtmp://a.rtmp.youtube.com/live2/43wg-ubwg-3wea-ezd4-7wj1"
+    "rtmp://a.rtmp.youtube.com/live2/e64m-e0kj-xbd4-24vm-c7rr"
 ).strip()
 
 CHECK_INTERVAL_OFFLINE = 15
