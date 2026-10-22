@@ -10,12 +10,12 @@ from datetime import datetime
 
 TIKTOK_URL = os.getenv(
     "TIKTOK_URL",
-    "https://www.tiktok.com/@m.dawoud2/live"
+    "https://www.tiktok.com/@d.shakertawfiqalaroury/live"
 ).strip()
 
 YOUTUBE_RTMP = os.getenv(
     "YOUTUBE_RTMP",
-    "rtmp://a.rtmp.youtube.com/live2/e64m-e0kj-xbd4-24vm-c7rr"
+    "rtmp://a.rtmp.youtube.com/live2/rvz8-2zmy-jxt4-hvdd-a19k"
 ).strip()
 
 CHECK_INTERVAL_OFFLINE = 15
