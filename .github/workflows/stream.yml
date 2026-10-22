@@ -1,7 +1,9 @@
 name: Run 6-Hour Stream via Docker
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # للتشغيل اليدوي متى شئت
+  schedule:
+    - cron: '0 */5 * * *' # للتشغيل تلقائياً كل 5 ساعات
 
 jobs:
   run-docker-stream:
