@@ -18,8 +18,8 @@ YOUTUBE_RTMP = os.getenv(
     "rtmp://a.rtmp.youtube.com/live2/rvz8-2zmy-jxt4-hvdd-a19k"
 ).strip()
 
-CHECK_INTERVAL_OFFLINE = 15
-RETRY_DELAY = 5
+CHECK_INTERVAL_OFFLINE = 10
+RETRY_DELAY = 2
 
 stop_event = threading.Event()
 streamlink_process = None
@@ -74,26 +74,26 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 
-# ================== STREAMLINK ==================
+# ================== STREAMLINK (BUFFER 512M) ==================
 
 def make_streamlink_command():
     return [
         "streamlink",
         "--loglevel", "warning",
-        "--hls-live-edge", "4",
-        "--ringbuffer-size", "128M",
-        "--retry-streams", "5",
-        "--retry-max", "10",
-        "--stream-segment-attempts", "5",
-        "--stream-segment-timeout", "10",
-        "--stream-timeout", "20",
+        "--hls-live-edge", "6",
+        "--ringbuffer-size", "512M",         # تم ضبط الـ Buffer على 512 ميجابايت
+        "--retry-streams", "20",
+        "--retry-max", "40",
+        "--stream-segment-attempts", "20",
+        "--stream-segment-timeout", "20",
+        "--stream-timeout", "45",
         "--stdout",
         TIKTOK_URL,
         "best"
     ]
 
 
-# ================== FFMPEG ==================
+# ================== FFMPEG (BUFFER & REALTIME) ==================
 
 def make_ffmpeg_command():
     return [
@@ -103,7 +103,8 @@ def make_ffmpeg_command():
         "-stats_period", "10",
         "-nostdin",
 
-        "-thread_queue_size", "1024",
+        "-re",                             # منع مشكلة إرسال البيانات أسرع من الوقت الحقيقي
+        "-thread_queue_size", "16384",     # طابور ذاكرة متوافق مع حجم الـ 512M
         "-i", "pipe:0",
 
         "-map", "0:v:0",
@@ -135,7 +136,7 @@ def start_stream():
     if stop_event.is_set():
         return False
 
-    log("Connecting to TikTok Live...")
+    log("Connecting to TikTok Live with 512M Buffer...")
 
     streamlink_process = subprocess.Popen(
         make_streamlink_command(),
@@ -169,7 +170,7 @@ def start_stream():
 
     streamlink_process.stdout.close()
 
-    log("Relay started. Video COPY; audio AAC 128k.")
+    log("Relay started with 512M buffer and realtime pacing. Video COPY; audio AAC 128k.")
 
     while not stop_event.is_set():
         sl_code = streamlink_process.poll()
