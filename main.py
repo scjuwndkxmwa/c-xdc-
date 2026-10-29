@@ -7,18 +7,18 @@ import sys
 TIKTOK_URL = "https://www.tiktok.com/@d.shakertawfiqalaroury/live"
 YOUTUBE_RTMP = "rtmp://a.rtmp.youtube.com/live2/vksy-du6k-8cxj-u7kh-7mfm"
 
-CHECK_INTERVAL_OFFLINE = 15      # وقت الفحص إذا كان البث غير متاح تماماً (15 ثانية)
-RECONNECT_INTERVAL_ONLINE = 0.5   # وقت إعادة المحاولة السريعة عند التقطيع (نصف ثانية)
+CHECK_INTERVAL_OFFLINE = 15       # وقت الفحص عندما يكون البث متوقفاً تماماً (15 ثانية)
+RECONNECT_INTERVAL_ONLINE = 0.1   # إعادة الاتصال فوراً عند التقطيع (0.1 ثانية فقط)
 
 STREAMLINK_CMD = [
     "streamlink",
-    "--hls-live-edge", "3",
+    "--hls-live-edge", "5",
     "--ringbuffer-size", "512M",
-    "--retry-streams", "1",
-    "--retry-max", "0",           # 0 تعني محاولات لا نهائية لمنع إغلاق Streamlink عند تقطيع الـ VPN
-    "--stream-segment-attempts", "10",
+    "--retry-streams", "0",
+    "--retry-max", "0",
+    "--stream-segment-attempts", "20",
     "--stream-segment-timeout", "10",
-    "--stream-timeout", "15",
+    "--stream-timeout", "30",
     "--stdout",
     TIKTOK_URL,
     "best"
@@ -34,7 +34,7 @@ FFMPEG_CMD = [
     "-fflags", "+genpts+discardcorrupt",
     "-err_detect", "ignore_err",
 
-    "-thread_queue_size", "2048",  # زيادة حجم الـ queue لامتصاص التقطيعات السريعة
+    "-thread_queue_size", "2048",
     "-i", "-",
 
     "-map", "0:v:0",
@@ -109,7 +109,6 @@ while True:
 
         time.sleep(2)
         
-        # إذا كان Streamlink غير قادر على فتح البث (البث أوفلاين)
         if streamlink_process.poll() is not None:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Stream is OFFLINE. Re-checking in {CHECK_INTERVAL_OFFLINE}s...")
             cleanup()
@@ -143,6 +142,5 @@ while True:
     finally:
         cleanup()
 
-    # إذا انقطع البث أثناء التشغيل يطلب إعادة الاتصال بعد 0.5 ثانية فقط
-    print(f"Quick reconnecting in {RECONNECT_INTERVAL_ONLINE}s...\n")
+    print(f"Instant reconnecting in {RECONNECT_INTERVAL_ONLINE}s...\n")
     time.sleep(RECONNECT_INTERVAL_ONLINE)
