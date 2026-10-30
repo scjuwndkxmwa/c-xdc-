@@ -39,10 +39,10 @@ except Exception as _e:  # library missing/broken -> polling-only mode
 # Config (can be overridden with environment variables)
 # --------------------------------------------------------------------------
 TIKTOK_URL = os.environ.get(
-    "TIKTOK_URL", "https://www.tiktok.com/@zain_kairalah2/live"
+    "TIKTOK_URL", "https://www.tiktok.com/@d.shakertawfiqalaroury/live"
 )
 YOUTUBE_RTMP = os.environ.get(
-    "YOUTUBE_RTMP", "rtmp://a.rtmp.youtube.com/live2/5czj-a0sq-5cmp-4aps-bq5h"
+    "YOUTUBE_RTMP", "rtmp://a.rtmp.youtube.com/live2/vksy-du6k-8cxj-u7kh-7mfm"
 )
 _m = re.search(r"tiktok\.com/@([^/?#]+)", TIKTOK_URL)
 TIKTOK_USERNAME = os.environ.get("TIKTOK_USERNAME") or (_m.group(1) if _m else "")
