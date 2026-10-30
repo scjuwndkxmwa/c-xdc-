@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """TikTok Live -> YouTube restreamer, built to keep running unattended 24/7.
 
-Fix: Re-encodes video with ultrafast preset and fixed 1080x1920 scale/pad
-filter so YouTube canvas size NEVER changes when TikTok layout changes.
+Pure Stream Copy Mode (-c:v copy): Direct passthrough without video re-encoding.
 """
 import asyncio
 import logging
@@ -129,12 +128,7 @@ def build_ffmpeg_cmd():
         "-i", "-",
 
         "-map", "0:v:0",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-        "-r", "30",
-        "-g", "60",
+        "-c:v", "copy",  # نقل الفيديو كاملاً كما هو دون أي تعديل أو إعادة تشفير
 
         "-map", "0:a:0?",
         "-c:a", "aac",
@@ -143,6 +137,7 @@ def build_ffmpeg_cmd():
         "-ac", "2",
         "-af", "aresample=async=1000:min_hard_comp=0.100000:first_pts=0",
 
+        "-fps_mode", "passthrough",
         "-max_muxing_queue_size", "4096",
         "-flush_packets", "1",
         "-flvflags", "no_duration_filesize",
@@ -203,7 +198,7 @@ class FFmpegSink:
         return self.proc is not None
 
     def start(self):
-        log("Starting FFmpeg -> YouTube RTMP (fixed 1080x1920 canvas)...")
+        log("Starting FFmpeg -> YouTube RTMP (pure stream copy)...")
         self.proc = subprocess.Popen(
             build_ffmpeg_cmd(), stdin=subprocess.PIPE, stdout=None, stderr=None
         )
@@ -623,7 +618,7 @@ class Restreamer:
         return self.handle_unknown()
 
     def run(self):
-        log("TikTok Live -> YouTube Auto-Restreamer v4 (fixed 1080x1920 encoding)")
+        log("TikTok Live -> YouTube Auto-Restreamer v4 (pure -c:v copy)")
         log(f"Watching: {TIKTOK_URL}")
         Watchdog(self).start()
         if TikTokLiveClient is not None and TIKTOK_USERNAME:
