@@ -1,15 +1,17 @@
 FROM python:3.11-slim
 
-WORKDIR /app
+ENV PYTHONUNBUFFERED=1
 
-# تثبيت ffmpeg الخفيف بدون مكتبات رسومية
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
 
-COPY main.py .
+# Install dependencies first so code-only changes don't re-download everything
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir "urllib3<2.0.0" -r requirements.txt
 
-CMD ["python", "-u", "main.py"]
+COPY . /app
+
+CMD ["python", "main.py"]
