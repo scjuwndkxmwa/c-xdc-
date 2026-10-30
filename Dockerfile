@@ -8,7 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install dependencies first so code-only changes don't re-download everything
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir "urllib3<2.0.0" -r requirements.txt
 
