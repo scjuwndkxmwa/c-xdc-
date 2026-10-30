@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
-"""TikTok Live -> YouTube restreamer, built to keep running unattended 24/7.
+"""TikTok Live -> YouTube restreamer with reconnect and end detection.
 
-Pure Stream Copy Mode (-c:v copy): Direct passthrough without video re-encoding.
+How the mobile app behaves, and how this script copies it:
+
+  * Temporary source/network drops trigger reconnection attempts while FFmpeg
+    remains alive when possible. RTMP continuity cannot be guaranteed.
+  * TikTokLive Webcast events are used as one signal for detecting the end;
+    polling fallbacks are retained because the event is not guaranteed.
+
+Safety nets (only used when the websocket signal is missing):
+  * Websocket NOT connected  -> falls back to polling and requires a sustained
+                                 offline result (OFFLINE_CONFIRM_SECONDS).
+  * Websocket connected, but TikTok keeps saying "not live" without ever
+    sending LiveEndEvent for ENDED_WITHOUT_EVENT_SECONDS -> ends anyway.
+  * TikTok completely unreachable for NETWORK_FAILSAFE_SECONDS -> ends.
 """
 import asyncio
-import logging
 import os
 import queue
-import random
 import re
 import signal
 import subprocess
 import sys
 import threading
 import time
-import traceback
 
 import streamlink
 
@@ -26,61 +35,28 @@ except Exception as _e:  # library missing/broken -> polling-only mode
     TikTokLiveClient = None
     _TIKTOKLIVE_IMPORT_ERROR = _e
 
-
-# ==========================================================================
-# Config (every value can be overridden with an environment variable)
-# ==========================================================================
-def _env(name, default, cast=str):
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return cast(raw)
-    except ValueError:
-        print(f"[CONFIG] bad value for {name}={raw!r}; using {default!r}", flush=True)
-        return default
-
-
-TIKTOK_URL = _env("TIKTOK_URL", "https://www.tiktok.com/@zain_kairalah2/live")
-YOUTUBE_RTMP = _env("YOUTUBE_RTMP", "rtmp://a.rtmp.youtube.com/live2/5czj-a0sq-5cmp-4aps-bq5h")
+# --------------------------------------------------------------------------
+# Config (can be overridden with environment variables)
+# --------------------------------------------------------------------------
+TIKTOK_URL = os.environ.get(
+    "TIKTOK_URL", "https://www.tiktok.com/@zain_kairalah2/live"
+)
+YOUTUBE_RTMP = os.environ.get(
+    "YOUTUBE_RTMP", "rtmp://a.rtmp.youtube.com/live2/5czj-a0sq-5cmp-4aps-bq5h"
+)
 _m = re.search(r"tiktok\.com/@([^/?#]+)", TIKTOK_URL)
-TIKTOK_USERNAME = _env("TIKTOK_USERNAME", _m.group(1) if _m else "")
+TIKTOK_USERNAME = os.environ.get("TIKTOK_USERNAME") or (_m.group(1) if _m else "")
 
-# Source / quality
-STREAM_QUALITY = _env("STREAM_QUALITY", "best")
-HLS_LIVE_EDGE = _env("HLS_LIVE_EDGE", 2, int)
-CHUNK_SIZE = 64 * 1024
+CHUNK_SIZE = 64 * 1024  # 64KB reads from Streamlink
 
-# Reconnect pacing
-RECONNECT_BASE_DELAY = _env("RECONNECT_BASE_DELAY", 0.5, float)
-RECONNECT_MAX_DELAY = _env("RECONNECT_MAX_DELAY", 5.0, float)
-HEALTHY_SESSION_SECONDS = _env("HEALTHY_SESSION_SECONDS", 10.0, float)
-STREAM_STALL_SECONDS = _env("STREAM_STALL_SECONDS", 15.0, float)
-
-# Live / end detection
-OFFLINE_POLL_INTERVAL = _env("OFFLINE_POLL_INTERVAL", 5.0, float)
-ENDED_POLL_INTERVAL = _env("ENDED_POLL_INTERVAL", 2.0, float)
-END_CONFIRM_INTERVAL = _env("END_CONFIRM_INTERVAL", 1.0, float)
-OFFLINE_CONFIRM_SECONDS = _env("OFFLINE_CONFIRM_SECONDS", 25.0, float)
-ENDED_WITHOUT_EVENT_SECONDS = _env("ENDED_WITHOUT_EVENT_SECONDS", 60.0, float)
-NETWORK_FAILSAFE_SECONDS = _env("NETWORK_FAILSAFE_SECONDS", 180.0, float)
-STALE_LIVE_SECONDS = _env("STALE_LIVE_SECONDS", 120.0, float)
-WS_POLL_INTERVAL = _env("WS_POLL_INTERVAL", 3.0, float)
-WS_MAX_BACKOFF = _env("WS_MAX_BACKOFF", 60.0, float)
-
-# FFmpeg supervision
-WRITE_STALL_SECONDS = _env("WRITE_STALL_SECONDS", 15.0, float)
-FFMPEG_BACKOFF_BASE = _env("FFMPEG_BACKOFF_BASE", 1.0, float)
-FFMPEG_BACKOFF_MAX = _env("FFMPEG_BACKOFF_MAX", 30.0, float)
-FFMPEG_HEALTHY_SECONDS = _env("FFMPEG_HEALTHY_SECONDS", 30.0, float)
-AUDIO_BITRATE = _env("AUDIO_BITRATE", "128k")
-FFMPEG_PROBESIZE = _env("FFMPEG_PROBESIZE", "")
-FFMPEG_ANALYZEDURATION = _env("FFMPEG_ANALYZEDURATION", "")
-
-# Self-protection / diagnostics
-WATCHDOG_SECONDS = _env("WATCHDOG_SECONDS", 300.0, float)
-STATUS_INTERVAL = _env("STATUS_INTERVAL", 120.0, float)
-LOG_LEVEL = _env("LOG_LEVEL", "WARNING").upper()
+RECONNECT_DELAY = float(os.environ.get("RECONNECT_DELAY", "0.5"))
+STREAM_STALL_SECONDS = float(os.environ.get("STREAM_STALL_SECONDS", "15"))
+OFFLINE_POLL_INTERVAL = float(os.environ.get("OFFLINE_POLL_INTERVAL", "5"))
+WS_POLL_INTERVAL = float(os.environ.get("WS_POLL_INTERVAL", "5"))
+OFFLINE_CONFIRM_SECONDS = float(os.environ.get("OFFLINE_CONFIRM_SECONDS", "25"))
+END_CONFIRM_INTERVAL = float(os.environ.get("END_CONFIRM_INTERVAL", "1"))
+ENDED_WITHOUT_EVENT_SECONDS = float(os.environ.get("ENDED_WITHOUT_EVENT_SECONDS", "60"))
+NETWORK_FAILSAFE_SECONDS = float(os.environ.get("NETWORK_FAILSAFE_SECONDS", "180"))
 
 LIVE, ENDED, UNKNOWN = "live", "ended", "unknown"
 
@@ -89,164 +65,88 @@ def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
-class Backoff:
-    def __init__(self, base, cap, factor=2.0, jitter=0.2):
-        self.base, self.cap, self.factor, self.jitter = base, cap, factor, jitter
-        self.attempt = 0
-
-    def reset(self):
-        self.attempt = 0
-
-    def next(self):
-        delay = min(self.cap, self.base * (self.factor ** self.attempt))
-        self.attempt += 1
-        return max(0.0, delay * (1.0 + random.uniform(-self.jitter, self.jitter)))
-
-
-class FFmpegDied(Exception):
-    pass
-
-
 def build_ffmpeg_cmd():
-    cmd = [
+    return [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",
         "-stats",
-        "-stats_period", "15",
 
         "-dts_delta_threshold", "1",
         "-fflags", "+genpts+discardcorrupt",
         "-err_detect", "ignore_err",
-    ]
-    if FFMPEG_PROBESIZE:
-        cmd += ["-probesize", FFMPEG_PROBESIZE]
-    if FFMPEG_ANALYZEDURATION:
-        cmd += ["-analyzeduration", FFMPEG_ANALYZEDURATION]
-    cmd += [
+
         "-thread_queue_size", "2048",
         "-i", "-",
 
         "-map", "0:v:0",
-        "-c:v", "copy",  # نقل الفيديو كاملاً كما هو دون أي تعديل أو إعادة تشفير
+        "-c:v", "copy",
 
         "-map", "0:a:0?",
         "-c:a", "aac",
-        "-b:a", AUDIO_BITRATE,
+        "-b:a", "128k",
         "-ar", "44100",
         "-ac", "2",
         "-af", "aresample=async=1000:min_hard_comp=0.100000:first_pts=0",
 
         "-fps_mode", "passthrough",
-        "-max_muxing_queue_size", "4096",
         "-flush_packets", "1",
+
         "-flvflags", "no_duration_filesize",
 
         "-f", "flv",
         YOUTUBE_RTMP,
     ]
-    return cmd
 
 
 def make_session():
     session = streamlink.Streamlink()
 
     def set_opt(key, value):
+        # Newer Streamlink uses session.options; older uses set_option().
         try:
-            try:
-                session.options.set(key, value)
-            except AttributeError:
-                session.set_option(key, value)
-        except Exception as e:
-            log(f"[CONFIG] could not set Streamlink option {key}: {e}")
+            session.options.set(key, value)
+        except AttributeError:
+            session.set_option(key, value)
 
-    set_opt("hls-live-edge", HLS_LIVE_EDGE)
-    set_opt("ringbuffer-size", 64 * 1024 * 1024)
+    set_opt("hls-live-edge", 2)
+    set_opt("ringbuffer-size", 64 * 1024 * 1024)  # 64MB
     set_opt("stream-segment-attempts", 10)
     set_opt("stream-segment-timeout", 10)
     set_opt("stream-timeout", 30)
-    set_opt("hls-playlist-reload-attempts", 10)
-    set_opt("http-timeout", 10)
+    set_opt("hls-playlist-reload-attempts", 10)  # default 3: ride out short outages in the same session
     return session
 
 
 def classify_error(exc):
+    """Decide whether an exception from session.streams() means
+    'user not live' (ENDED) or 'we couldn't reach TikTok' (UNKNOWN)."""
     seen = set()
     cur = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
+        # requests' ConnectionError/Timeout/etc. are all OSError subclasses.
         if isinstance(cur, OSError):
             response = getattr(cur, "response", None)
             if response is not None and getattr(response, "status_code", None) == 404:
                 return ENDED
             return UNKNOWN
         cur = cur.__cause__ or cur.__context__
+    # Only a clear no-stream result should count as offline. Generic plugin
+    # errors can also be caused by temporary TikTok/network changes.
     if type(exc).__name__ == "NoStreamsError":
         return ENDED
-    return UNKNOWN
+    return UNKNOWN  # unexpected error: be conservative, don't end the broadcast
 
 
-class FFmpegSink:
-    def __init__(self):
-        self.proc = None
-        self.started_at = 0.0
-        self.write_began = None
-        self.starts = 0
-
-    @property
-    def active(self):
-        return self.proc is not None
-
-    def start(self):
-        log("Starting FFmpeg -> YouTube RTMP (pure stream copy)...")
-        self.proc = subprocess.Popen(
-            build_ffmpeg_cmd(), stdin=subprocess.PIPE, stdout=None, stderr=None
-        )
-        self.started_at = time.monotonic()
-        self.starts += 1
-
-    def write(self, data):
-        proc = self.proc
-        if proc is None or proc.poll() is not None:
-            raise FFmpegDied(f"exit code {proc.returncode if proc else 'n/a'}")
-        self.write_began = time.monotonic()
-        try:
-            proc.stdin.write(data)
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError) as e:
-            raise FFmpegDied(str(e)) from e
-        finally:
-            self.write_began = None
-
-    def kill(self):
-        proc = self.proc
-        if proc is not None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-    def stop(self, reason, grace=8.0):
-        proc, self.proc = self.proc, None
-        if proc is None:
-            return
-        log(f"Stopping FFmpeg ({reason})...")
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+class FFmpegDied(Exception):
+    pass
 
 
 class LiveEndMonitor(threading.Thread):
+    """Listens to TikTok's Webcast websocket (same channel the mobile app uses)
+    and tells the Restreamer when TikTok announces the live has ended."""
+
     def __init__(self, owner):
         super().__init__(daemon=True, name="live-end-monitor")
         self.owner = owner
@@ -261,7 +161,6 @@ class LiveEndMonitor(threading.Thread):
     async def _main(self):
         owner = self.owner
         last_err = None
-        err_backoff = Backoff(WS_POLL_INTERVAL, WS_MAX_BACKOFF)
         while not owner.stop.is_set():
             client = TikTokLiveClient(unique_id=f"@{TIKTOK_USERNAME}")
 
@@ -279,13 +178,10 @@ class LiveEndMonitor(threading.Thread):
             async def _on_disconnect(event):
                 owner.ws_connected.clear()
 
-            delay = WS_POLL_INTERVAL
             try:
                 if await client.is_live():
-                    owner.wake.set()
                     last_err = None
-                    err_backoff.reset()
-                    await client.connect()
+                    await client.connect()  # returns when the connection ends
                     log("[WS] webcast connection closed")
                 else:
                     owner.ws_connected.clear()
@@ -296,163 +192,120 @@ class LiveEndMonitor(threading.Thread):
                 if msg != last_err:
                     log(f"[WS] error: {msg}")
                     last_err = msg
-                delay = err_backoff.next()
             owner.ws_connected.clear()
-            await asyncio.sleep(delay)
-
-
-class Watchdog(threading.Thread):
-    def __init__(self, owner):
-        super().__init__(daemon=True, name="watchdog")
-        self.owner = owner
-
-    def run(self):
-        owner = self.owner
-        last_status = time.monotonic()
-        while not owner.stop.wait(0.5):
-            now = time.monotonic()
-
-            began = owner.sink.write_began
-            if began is not None and now - began > WRITE_STALL_SECONDS:
-                log(f"WATCHDOG: FFmpeg not accepting data for {now - began:.0f}s "
-                    "(RTMP stuck?) -> killing FFmpeg to restart it.")
-                owner.sink.kill()
-                owner.sink.write_began = None
-
-            if now - owner.heartbeat > WATCHDOG_SECONDS:
-                log(f"WATCHDOG: main loop frozen for {WATCHDOG_SECONDS:.0f}s -> exiting "
-                    "so Docker restarts a clean process.")
-                owner.sink.kill()
-                os._exit(3)
-
-            if owner.sink.active and now - last_status >= STATUS_INTERVAL:
-                last_status = now
-                s = owner.stats
-                log(
-                    f"[STATUS] streaming | forwarded {s['bytes'] / 1e6:.0f} MB | "
-                    f"source reconnects {s['source_drops']} | "
-                    f"FFmpeg starts {owner.sink.starts} (failures {s['ffmpeg_failures']}) | "
-                    f"websocket {'on' if owner.ws_connected.is_set() else 'off'}"
-                )
+            await asyncio.sleep(WS_POLL_INTERVAL)
 
 
 class Restreamer:
     def __init__(self):
         self.stop = threading.Event()
-        self.wake = threading.Event()
         self.session = make_session()
-        self.sink = FFmpegSink()
-        self.heartbeat = time.monotonic()
+        self.ffmpeg = None
         self.last_data = 0.0
-        self.stats = {"bytes": 0, "source_drops": 0, "ffmpeg_failures": 0}
-
         self._last_status_msg = None
-        self._last_quality_msg = None
-        self.extra_delay = 0.0
-        self.unknown_count = 0
-        self.source_backoff = Backoff(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY)
-        self.unknown_backoff = Backoff(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY)
-        self.ffmpeg_backoff = Backoff(FFMPEG_BACKOFF_BASE, FFMPEG_BACKOFF_MAX)
 
+        # TikTok-announced end (set from the websocket thread)
         self.live_over = threading.Event()
-        self.live_over_since = None
         self.ended_room_id = None
         self.ws_connected = threading.Event()
         self.current_fd = None
-        self.ended_since = None
+        self.ended_since = None  # polling says "not live" since...
 
-    def beat(self):
-        self.heartbeat = time.monotonic()
-
-    def nap(self, seconds, wakeable=False):
-        end = time.monotonic() + seconds
-        while not self.stop.is_set():
-            self.beat()
-            if wakeable and self.wake.is_set():
-                self.wake.clear()
-                return
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                return
-            self.stop.wait(min(remaining, 0.2))
-
+    # ---------------- websocket callbacks (other thread) ----------------
     def on_ws_connect(self, room_id):
         self.ws_connected.set()
-        if self.live_over.is_set() and room_id is not None and room_id != self.ended_room_id:
+        if (
+            self.live_over.is_set()
+            and room_id is not None
+            and room_id != self.ended_room_id
+        ):
             log("New live room detected - ready to restream again.")
             self.live_over.clear()
 
     def on_live_end(self, room_id):
         log("TikTok announced: LIVE HAS ENDED -> ending YouTube broadcast now.")
         self.ended_room_id = room_id
-        self.live_over_since = time.monotonic()
         self.live_over.set()
         fd = self.current_fd
         if fd is not None:
             try:
-                fd.close()
+                fd.close()  # unblock the reader immediately
             except Exception:
                 pass
 
-    def write(self, data):
-        if not self.sink.active:
-            self.sink.start()
-            self.last_data = time.monotonic()
-        self.sink.write(data)
+    # ---------------- FFmpeg lifecycle ----------------
+    def start_ffmpeg(self):
+        log("Starting FFmpeg -> YouTube RTMP (persistent)...")
+        self.ffmpeg = subprocess.Popen(
+            build_ffmpeg_cmd(),
+            stdin=subprocess.PIPE,
+            stdout=None,
+            stderr=None,
+        )
         self.last_data = time.monotonic()
-        self.stats["bytes"] += len(data)
 
-    def on_ffmpeg_failure(self, why):
-        uptime = time.monotonic() - self.sink.started_at if self.sink.started_at else 0.0
-        self.stats["ffmpeg_failures"] += 1
-        self.sink.stop("died", grace=2)
-        if uptime >= FFMPEG_HEALTHY_SECONDS:
-            self.ffmpeg_backoff.reset()
-        wait = self.ffmpeg_backoff.next()
-        self.extra_delay = max(self.extra_delay, wait)
-        log(f"FFmpeg failed after {uptime:.0f}s ({why}); restarting in {wait:.1f}s with a fresh stream.")
+    def stop_ffmpeg(self, reason):
+        proc, self.ffmpeg = self.ffmpeg, None
+        if proc is None:
+            return
+        log(f"Stopping FFmpeg ({reason})...")
+        try:
+            proc.stdin.close()  # EOF -> FFmpeg finalizes and closes RTMP
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
+    def write(self, data):
+        if self.ffmpeg is None:
+            self.start_ffmpeg()
+        if self.ffmpeg.poll() is not None:
+            raise FFmpegDied(f"exit code {self.ffmpeg.returncode}")
+        try:
+            self.ffmpeg.stdin.write(data)
+            self.ffmpeg.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as e:
+            raise FFmpegDied(str(e))
+        self.last_data = time.monotonic()
+
+    # ---------------- TikTok side ----------------
     def _note(self, msg):
         if msg != self._last_status_msg:
             log(msg)
             self._last_status_msg = msg
 
-    def pick_stream(self, streams):
-        names = sorted(streams.keys())
-        prefs = [q.strip() for q in STREAM_QUALITY.split(",") if q.strip()]
-        chosen = next((q for q in prefs if q in streams), None)
-        if chosen is None:
-            chosen = "best" if "best" in streams else names[0]
-        stream = streams[chosen]
-        kind = type(stream).__name__
-        msg = f"Qualities available: {', '.join(names)} | using '{chosen}' ({kind})"
-        if msg != self._last_quality_msg:
-            log(msg)
-            self._last_quality_msg = msg
-        return stream
-
     def check_live(self):
-        self.beat()
+        """Ask TikTok (via Streamlink) if the user is live."""
         try:
             streams = self.session.streams(TIKTOK_URL)
         except Exception as e:
             status = classify_error(e)
             if status == ENDED:
-                self.unknown_backoff.reset()
-                self.unknown_count = 0
                 self._note(f"TikTok says NOT live ({type(e).__name__}: {e})")
             else:
                 self._note(f"Cannot reach TikTok - network hiccup? ({type(e).__name__}: {e})")
             return status, None
-        self.unknown_backoff.reset()
-        self.unknown_count = 0
-        if not streams:
+        stream = streams.get("best") if streams else None
+        if stream is None:
             self._note("TikTok says NOT live (no streams)")
             return ENDED, None
         self._note("TikTok says LIVE")
-        return LIVE, self.pick_stream(streams)
+        return LIVE, stream
 
     def stream_session(self, stream):
+        """Pipe the source to FFmpeg while keeping reads from blocking forever.
+
+        Streamlink's read() can stall during a network problem. A small bounded
+        queue lets the supervisor detect a stalled source and reconnect instead
+        of waiting forever inside read().
+        """
         try:
             fd = stream.open()
         except Exception as e:
@@ -460,22 +313,29 @@ class Restreamer:
             return
 
         self.current_fd = fd
-        chunks = queue.Queue(maxsize=32)
+        chunks = queue.Queue(maxsize=16)
         reader_done = threading.Event()
 
         def reader():
             try:
                 while not self.stop.is_set() and not self.live_over.is_set():
                     data = fd.read(CHUNK_SIZE)
-                    kind, payload = ("data", data) if data else ("eof", None)
+                    if not data:
+                        # Never let the reader thread block forever trying to
+                        # report EOF when the bounded queue is full.
+                        while not self.stop.is_set() and not self.live_over.is_set():
+                            try:
+                                chunks.put(("eof", None), timeout=0.5)
+                                return
+                            except queue.Full:
+                                continue
+                        return
                     while not self.stop.is_set() and not self.live_over.is_set():
                         try:
-                            chunks.put((kind, payload), timeout=0.5)
+                            chunks.put(("data", data), timeout=0.5)
                             break
                         except queue.Full:
                             continue
-                    if kind == "eof":
-                        return
             except Exception as e:
                 try:
                     chunks.put(("error", e), timeout=0.5)
@@ -489,10 +349,8 @@ class Restreamer:
         last_chunk = time.monotonic()
         try:
             while not self.stop.is_set() and not self.live_over.is_set():
-                self.beat()
-                proc = self.sink.proc
-                if proc is not None and proc.poll() is not None:
-                    raise FFmpegDied(f"exit code {proc.returncode}")
+                if self.ffmpeg is not None and self.ffmpeg.poll() is not None:
+                    raise FFmpegDied(f"exit code {self.ffmpeg.returncode}")
                 try:
                     kind, payload = chunks.get(timeout=0.2)
                 except queue.Empty:
@@ -514,8 +372,11 @@ class Restreamer:
                         log(f"Read error from TikTok: {payload}")
                     return
         except FFmpegDied as e:
-            self.on_ffmpeg_failure(str(e))
+            log(f"FFmpeg died ({e}); restarting it with a fresh stream.")
+            self.stop_ffmpeg("died")
         finally:
+            # Close the source before clearing the shared handle. This often
+            # unblocks a reader stuck inside Streamlink's read().
             try:
                 fd.close()
             except Exception:
@@ -523,31 +384,12 @@ class Restreamer:
             if self.current_fd is fd:
                 self.current_fd = None
 
-    def run_live(self, stream):
-        self.ended_since = None
-        started = time.monotonic()
-        self.stream_session(stream)
-        if self.stop.is_set():
-            return LIVE, None
-        if self.live_over.is_set():
-            return self.check_live()
-        duration = time.monotonic() - started
-        self.stats["source_drops"] += 1
-        if duration >= HEALTHY_SESSION_SECONDS:
-            self.source_backoff.reset()
-            delay = RECONNECT_BASE_DELAY
-        else:
-            delay = self.source_backoff.next()
-        delay = max(delay, self.extra_delay)
-        self.extra_delay = 0.0
-        log(f"TikTok data stopped after {duration:.0f}s - checking if live is still on (in {delay:.1f}s)...")
-        self.nap(delay)
-        return self.check_live()
-
+    # ---------------- State handlers ----------------
     def handle_ended(self):
-        if not self.sink.active:
+        """Polling says 'not live'. Returns the next (status, stream)."""
+        if self.ffmpeg is None:
             self.ended_since = None
-            self.nap(OFFLINE_POLL_INTERVAL, wakeable=True)
+            self.stop.wait(OFFLINE_POLL_INTERVAL)
             return self.check_live()
 
         now = time.monotonic()
@@ -555,72 +397,59 @@ class Restreamer:
             self.ended_since = now
 
         if self.ws_connected.is_set():
+            # Mobile-like: don't guess. Wait for TikTok's explicit LiveEndEvent.
+            # Safety net in case TikTok never sends it.
             if now - self.ended_since >= ENDED_WITHOUT_EVENT_SECONDS:
-                log(f"TikTok reports not-live for {ENDED_WITHOUT_EVENT_SECONDS:.0f}s "
-                    "with no LiveEndEvent -> ending.")
-                self.sink.stop("not live, no end event")
+                log(
+                    f"TikTok reports not-live for {ENDED_WITHOUT_EVENT_SECONDS:.0f}s "
+                    "with no LiveEndEvent -> ending."
+                )
+                self.stop_ffmpeg("not live, no end event")
                 self.ended_since = None
-                self.nap(OFFLINE_POLL_INTERVAL)
+                self.stop.wait(OFFLINE_POLL_INTERVAL)
                 return self.check_live()
-            self.nap(ENDED_POLL_INTERVAL)
+            self.stop.wait(RECONNECT_DELAY)
             return self.check_live()
 
+        # Websocket unavailable: do NOT end the broadcast after one or two
+        # failed checks. TikTok can briefly return no streams during a hiccup.
+        # Require a sustained offline period, while continuing to probe quickly
+        # so a returning LIVE can resume without restarting FFmpeg.
         if now - self.ended_since >= OFFLINE_CONFIRM_SECONDS:
-            log(f"TikTok returned NOT LIVE continuously for {OFFLINE_CONFIRM_SECONDS:.0f}s "
-                "(websocket unavailable) -> ending YouTube.")
-            self.sink.stop("live ended (confirmed by sustained polling)")
+            log(
+                f"TikTok returned NOT LIVE continuously for "
+                f"{OFFLINE_CONFIRM_SECONDS:.0f}s (websocket unavailable) -> ending YouTube."
+            )
+            self.stop_ffmpeg("live ended (confirmed by sustained polling)")
             self.ended_since = None
-            self.nap(OFFLINE_POLL_INTERVAL)
+            self.stop.wait(OFFLINE_POLL_INTERVAL)
             return self.check_live()
 
-        self.nap(END_CONFIRM_INTERVAL)
+        self.stop.wait(END_CONFIRM_INTERVAL)
         status, stream = self.check_live()
         if status != ENDED:
+            # A LIVE result or an unreachable/unknown result breaks the
+            # continuous-offline confirmation window.
             self.ended_since = None
         return status, stream
 
     def handle_unknown(self):
+        """Couldn't reach TikTok (our network). Keep FFmpeg, retry fast."""
         self.ended_since = None
-        self.unknown_count += 1
-        if self.unknown_count % 5 == 0:
-            log("Several network errors in a row - rebuilding the HTTP session.")
-            self.session = make_session()
-        if self.sink.active and time.monotonic() - self.last_data > NETWORK_FAILSAFE_SECONDS:
-            self.sink.stop(f"no data and TikTok unreachable for {NETWORK_FAILSAFE_SECONDS:.0f}s")
-        delay = self.unknown_backoff.next() if self.sink.active else OFFLINE_POLL_INTERVAL
-        self.nap(delay, wakeable=not self.sink.active)
+        if (
+            self.ffmpeg is not None
+            and time.monotonic() - self.last_data > NETWORK_FAILSAFE_SECONDS
+        ):
+            self.stop_ffmpeg(
+                f"no data and TikTok unreachable for {NETWORK_FAILSAFE_SECONDS:.0f}s"
+            )
+        self.stop.wait(RECONNECT_DELAY if self.ffmpeg is not None else OFFLINE_POLL_INTERVAL)
         return self.check_live()
 
-    def step(self, status, stream):
-        self.beat()
-        if self.live_over.is_set():
-            stale = (
-                status == LIVE
-                and self.live_over_since is not None
-                and time.monotonic() - self.live_over_since > STALE_LIVE_SECONDS
-            )
-            if stale:
-                log("TikTok still reports LIVE long after LiveEndEvent - assuming a new live.")
-                self.live_over.clear()
-            else:
-                if self.sink.active:
-                    self.sink.stop("TikTok LiveEndEvent")
-                if status == ENDED:
-                    self.live_over.clear()
-                self.ended_since = None
-                self.nap(OFFLINE_POLL_INTERVAL, wakeable=True)
-                return self.check_live()
-
-        if status == LIVE:
-            return self.run_live(stream)
-        if status == ENDED:
-            return self.handle_ended()
-        return self.handle_unknown()
-
+    # ---------------- Main loop ----------------
     def run(self):
-        log("TikTok Live -> YouTube Auto-Restreamer v4 (pure -c:v copy)")
+        log("TikTok Live -> YouTube Auto-Restreamer (persistent FFmpeg + stall recovery)")
         log(f"Watching: {TIKTOK_URL}")
-        Watchdog(self).start()
         if TikTokLiveClient is not None and TIKTOK_USERNAME:
             LiveEndMonitor(self).start()
             log("Live-end detection: TikTok websocket (LiveEndEvent)")
@@ -631,22 +460,36 @@ class Restreamer:
         try:
             status, stream = self.check_live()
             while not self.stop.is_set():
-                try:
-                    status, stream = self.step(status, stream)
-                except Exception:
-                    log("Unexpected error in main loop (continuing):\n" + traceback.format_exc())
-                    self.nap(2.0)
-                    status, stream = UNKNOWN, None
+                if self.live_over.is_set():
+                    # TikTok announced the end: close YouTube, then wait for a
+                    # genuinely new live (never restart on a stale stream).
+                    if self.ffmpeg is not None:
+                        self.stop_ffmpeg("TikTok LiveEndEvent")
+                    if status == ENDED:
+                        self.live_over.clear()
+                    self.ended_since = None
+                    self.stop.wait(OFFLINE_POLL_INTERVAL)
+                    status, stream = self.check_live()
+                    continue
+
+                if status == LIVE:
+                    self.ended_since = None
+                    self.stream_session(stream)
+                    if self.stop.is_set():
+                        break
+                    if not self.live_over.is_set():
+                        log("TikTok data stopped - checking if live is still on...")
+                        self.stop.wait(RECONNECT_DELAY)
+                    status, stream = self.check_live()
+                elif status == ENDED:
+                    status, stream = self.handle_ended()
+                else:
+                    status, stream = self.handle_unknown()
         finally:
-            self.sink.stop("shutdown", grace=4)
+            self.stop_ffmpeg("shutdown")
 
 
 def main():
-    logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL, logging.WARNING),
-        format="[%(asctime)s] [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
     restreamer = Restreamer()
 
     def handler(sig, frame):
@@ -654,10 +497,11 @@ def main():
         restreamer.stop.set()
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise SystemExit(0)
+        raise SystemExit(0)  # unwinds through run()'s finally -> stops FFmpeg
 
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
+
     restreamer.run()
 
 
