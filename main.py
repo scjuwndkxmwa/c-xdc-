@@ -63,7 +63,7 @@ def _env(name, default, cast=str):
         return default
 
 
-TIKTOK_URL = _env("TIKTOK_URL", "https://www.tiktok.com/@haesmm.66/live")
+TIKTOK_URL = _env("TIKTOK_URL", "https://www.tiktok.com/@___alzahabey4___/live")
 YOUTUBE_RTMP = _env("YOUTUBE_RTMP", "rtmp://a.rtmp.youtube.com/live2/5czj-a0sq-5cmp-4aps-bq5h")
 _m = re.search(r"tiktok\.com/@([^/?#]+)", TIKTOK_URL)
 TIKTOK_USERNAME = _env("TIKTOK_USERNAME", _m.group(1) if _m else "")
