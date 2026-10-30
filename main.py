@@ -21,9 +21,8 @@ What keeps it from dying (each layer covers a different failure)
                                   Docker (--restart unless-stopped) starts a clean one.
   * Catch-all error handler     - an unexpected exception is logged and the loop continues.
 
-Quality note: video is stream-copied (no re-encode), so picture quality equals what
-TikTok sends. STREAM_QUALITY chooses which TikTok quality to pull; the available
-names are logged at the start of every live.
+Quality note: video is stream-copied (-c:v copy), so picture quality equals what
+TikTok sends directly without CPU encoding overhead.
 """
 import asyncio
 import logging
@@ -155,7 +154,7 @@ def build_ffmpeg_cmd():
         "-i", "-",
 
         "-map", "0:v:0",
-        "-c:v", "copy",
+        "-c:v", "copy",  # نقل الفيديو كاملاً بدون إعادة تشفير للحفاظ على سرعة ومعالجة الجهاز
 
         "-map", "0:a:0?",
         "-c:a", "aac",
