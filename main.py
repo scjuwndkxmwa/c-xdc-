@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""TikTok Live -> YouTube Restreamer (OBS-Direct-URL Mode).
-Behaves exactly like OBS Studio: Extracts direct stream URL and lets FFmpeg handle network buffering natively.
+"""TikTok Live -> YouTube Restreamer (OBS-Direct-URL Mode with Fixed 5000k Bitrate).
 """
 import asyncio
 import os
@@ -40,13 +39,17 @@ YOUTUBE_RTMP = _env("YOUTUBE_RTMP", "rtmp://a.rtmp.youtube.com/live2/vksy-du6k-8
 _m = re.search(r"tiktok\.com/@([^/?#]+)", TIKTOK_URL)
 TIKTOK_USERNAME = _env("TIKTOK_USERNAME", _m.group(1) if _m else "")
 
+VIDEO_BITRATE = "5000k"
+FPS = 60
+GOP = FPS * 2  # keyframe every 2 seconds
+
 
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
 def build_ffmpeg_cmd(stream_url):
-    """OBS-style FFmpeg command using Direct Stream URL and native network reconnection."""
+    """FFmpeg command: true CBR 5000k, 60fps, audio 128k, source resolution untouched."""
     return [
         "ffmpeg",
         "-hide_banner",
@@ -54,23 +57,39 @@ def build_ffmpeg_cmd(stream_url):
         "-stats",
         "-stats_period", "15",
 
-        # Network Resilience Flags (Same as OBS Native Source)
+        # Network Resilience Flags
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
 
         "-i", stream_url,  # Direct TikTok Stream URL input
 
-        "-c:v", "copy",     # Pure Copy (No CPU Overhead)
+        # Video Encoding: Fixed CBR 5000k (no scale = same resolution as source)
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
+        "-b:v", VIDEO_BITRATE,
+        "-minrate", VIDEO_BITRATE,
+        "-maxrate", VIDEO_BITRATE,
+        "-bufsize", VIDEO_BITRATE,
+        "-x264-params", "nal-hrd=cbr:force-cfr=1",
+
+        # 60 fps + keyframe every 2 seconds
+        "-r", str(FPS),
+        "-g", str(GOP),
+        "-keyint_min", str(GOP),
+        "-sc_threshold", "0",
+        "-fps_mode", "cfr",
+
+        # Audio Encoding
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "44100",
         "-ac", "2",
         "-af", "aresample=async=1000:min_hard_comp=0.100000:first_pts=0",
 
-        "-fps_mode", "passthrough",
         "-flvflags", "no_duration_filesize",
-
         "-f", "flv",
         YOUTUBE_RTMP,
     ]
@@ -141,14 +160,13 @@ class Restreamer:
             streams = self.session.streams(TIKTOK_URL)
             if streams:
                 chosen = streams.get("best") or list(streams.values())[0]
-                # Extract direct stream URL (HLS / FLV URL)
                 return getattr(chosen, "url", None)
         except Exception:
             pass
         return None
 
     def run(self):
-        log("بدء تشغيل النقل بأسلوب OBS المباشر (OBS-Direct-URL Mode)...")
+        log("بدء تشغيل النقل بمعدل بت ثابت 5000k لمنع Preparing Stream...")
         log(f"الحساب المستهدف: {TIKTOK_URL}")
 
         if TikTokLiveClient and TIKTOK_USERNAME:
@@ -158,20 +176,18 @@ class Restreamer:
             stream_url = self.get_direct_stream_url()
 
             if stream_url:
-                log("تم التقاط رابط البث المباشر! تشغيل محرك FFmpeg بنمط OBS...")
+                log("تم التقاط رابط البث المباشر! تشغيل محرك FFmpeg بمعدل بت 5000k...")
                 self.live_ended_event.clear()
 
                 cmd = build_ffmpeg_cmd(stream_url)
                 self.proc = subprocess.Popen(cmd)
 
-                # الانتظار حتى ينتهي FFmpeg تلقائياً أو يصل أمر إغلاق البث من تيك توك
                 while not self.stop_event.is_set() and not self.live_ended_event.is_set():
                     if self.proc.poll() is not None:
                         log("عملية FFmpeg انتهت (البث توقف من المصدر).")
                         break
                     time.sleep(1)
 
-                # تنظيف العملية عند الخروج
                 if self.proc and self.proc.poll() is None:
                     try:
                         self.proc.terminate()
