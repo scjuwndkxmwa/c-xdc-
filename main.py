@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""TikTok Live -> YouTube Restreamer (OBS-Direct-URL Mode with Fixed 5000k Bitrate).
+"""TikTok Live -> YouTube Restreamer (Stable / Light / High Quality).
+
+Re-encodes video to true CBR 5000k (source resolution untouched),
+keyframe every 2 seconds, AAC 128k audio.
 """
 import asyncio
 import os
 import re
 import signal
 import subprocess
-import sys
 import threading
 import time
 
@@ -14,7 +16,7 @@ import streamlink
 
 try:
     from TikTokLive import TikTokLiveClient
-    from TikTokLive.events import ConnectEvent, DisconnectEvent, LiveEndEvent
+    from TikTokLive.events import ConnectEvent, LiveEndEvent
     _TIKTOKLIVE_IMPORT_ERROR = None
 except Exception as _e:
     TikTokLiveClient = None
@@ -35,13 +37,20 @@ def _env(name, default, cast=str):
 
 
 TIKTOK_URL = _env("TIKTOK_URL", "https://www.tiktok.com/@d.shakertawfiqalaroury/live")
-YOUTUBE_RTMP = _env("YOUTUBE_RTMP", "rtmp://a.rtmp.youtube.com/live2/se2e-5vc4-8k2a-4mvc-cpea")
+YOUTUBE_RTMP = _env("YOUTUBE_RTMP", "rtmp://a.rtmp.youtube.com/live2/vksy-du6k-8cxj-u7kh-7mfm")
 _m = re.search(r"tiktok\.com/@([^/?#]+)", TIKTOK_URL)
 TIKTOK_USERNAME = _env("TIKTOK_USERNAME", _m.group(1) if _m else "")
 
-VIDEO_BITRATE = "5000k"
-FPS = 60
-GOP = FPS * 2  # keyframe every 2 seconds
+VIDEO_BITRATE = _env("VIDEO_BITRATE", "5000k")
+AUDIO_BITRATE = _env("AUDIO_BITRATE", "128k")
+FPS = _env("FPS", 30, int)                      # المصدر تقريباً 15 فريم، 30 كفاية وأخف من 60
+X264_PRESET = _env("X264_PRESET", "veryfast")   # لو speed نزلت عن 1x رجّعها ultrafast
+GOP = FPS * 2                                   # keyframe كل ثانيتين
+
+CHECK_INTERVAL = _env("CHECK_INTERVAL", 1, float)  # فحص رابط البث كل ثانية (ارفعها لو تيك توك بدأ يبطّأ)
+LIVE_END_COOLDOWN = 15   # ثواني انتظار بعد إعلان تيك توك نهاية البث
+RESTART_DELAY = 1        # ثواني بين نهاية ffmpeg وإعادة المحاولة
+CRASH_DELAY = 10         # لو ffmpeg وقع بسرعة (أقل من 10 ثواني) استنى أكتر
 
 
 def log(msg):
@@ -49,25 +58,31 @@ def log(msg):
 
 
 def build_ffmpeg_cmd(stream_url):
-    """FFmpeg command: true CBR 5000k, 60fps, audio 128k, source resolution untouched."""
     return [
         "ffmpeg",
         "-hide_banner",
+        "-nostdin",
         "-loglevel", "warning",
         "-stats",
         "-stats_period", "15",
 
-        # Network Resilience Flags
+        # Network resilience
         "-reconnect", "1",
         "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
         "-reconnect_delay_max", "5",
+        "-fflags", "+genpts+discardcorrupt",
 
-        "-i", stream_url,  # Direct TikTok Stream URL input
+        "-i", stream_url,
 
-        # Video Encoding: Fixed CBR 5000k (no scale = same resolution as source)
+        # Streams: video + audio (audio optional)
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+
+        # Video: true CBR (no scale = same resolution as source)
         "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-tune", "zerolatency",
+        "-preset", X264_PRESET,
+        "-profile:v", "high",
         "-pix_fmt", "yuv420p",
         "-b:v", VIDEO_BITRATE,
         "-minrate", VIDEO_BITRATE,
@@ -75,20 +90,21 @@ def build_ffmpeg_cmd(stream_url):
         "-bufsize", VIDEO_BITRATE,
         "-x264-params", "nal-hrd=cbr:force-cfr=1",
 
-        # 60 fps + keyframe every 2 seconds
+        # Constant frame rate + fixed keyframes
         "-r", str(FPS),
+        "-fps_mode", "cfr",
         "-g", str(GOP),
         "-keyint_min", str(GOP),
         "-sc_threshold", "0",
-        "-fps_mode", "cfr",
 
-        # Audio Encoding
+        # Audio
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", AUDIO_BITRATE,
         "-ar", "44100",
         "-ac", "2",
         "-af", "aresample=async=1000:min_hard_comp=0.100000:first_pts=0",
 
+        "-max_muxing_queue_size", "1024",
         "-flvflags", "no_duration_filesize",
         "-f", "flv",
         YOUTUBE_RTMP,
@@ -147,13 +163,21 @@ class Restreamer:
         self.session = make_session()
         self.proc = None
 
+    def stop_ffmpeg(self):
+        proc = self.proc
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
     def on_live_ended(self):
         self.live_ended_event.set()
-        if self.proc:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
+        self.stop_ffmpeg()
 
     def get_direct_stream_url(self):
         try:
@@ -166,39 +190,55 @@ class Restreamer:
         return None
 
     def run(self):
-        log("بدء تشغيل النقل بمعدل بت ثابت 5000k لمنع Preparing Stream...")
+        log(f"بدء النقل: CBR {VIDEO_BITRATE} | {FPS}fps | preset={X264_PRESET} | صوت {AUDIO_BITRATE}")
         log(f"الحساب المستهدف: {TIKTOK_URL}")
+        log(f"فحص الرابط كل {CHECK_INTERVAL:g} ثانية")
 
         if TikTokLiveClient and TIKTOK_USERNAME:
             LiveEndMonitor(self).start()
+        else:
+            log(f"تنبيه: مراقب نهاية البث متوقف ({_TIKTOKLIVE_IMPORT_ERROR})")
+
+        waiting_logged = False
 
         while not self.stop_event.is_set():
             stream_url = self.get_direct_stream_url()
 
-            if stream_url:
-                log("تم التقاط رابط البث المباشر! تشغيل محرك FFmpeg بمعدل بت 5000k...")
-                self.live_ended_event.clear()
+            if not stream_url:
+                if not waiting_logged:
+                    log("البث مقفول حالياً... بفحص كل ثانية لحد ما يفتح.")
+                    waiting_logged = True
+                self.stop_event.wait(CHECK_INTERVAL)
+                continue
+            waiting_logged = False
 
-                cmd = build_ffmpeg_cmd(stream_url)
-                self.proc = subprocess.Popen(cmd)
+            log("تم التقاط رابط البث المباشر! تشغيل FFmpeg...")
+            self.live_ended_event.clear()
+            started = time.time()
 
-                while not self.stop_event.is_set() and not self.live_ended_event.is_set():
-                    if self.proc.poll() is not None:
-                        log("عملية FFmpeg انتهت (البث توقف من المصدر).")
-                        break
-                    time.sleep(1)
+            self.proc = subprocess.Popen(build_ffmpeg_cmd(stream_url))
 
-                if self.proc and self.proc.poll() is None:
-                    try:
-                        self.proc.terminate()
-                        self.proc.wait(timeout=3)
-                    except Exception:
-                        self.proc.kill()
-                self.proc = None
+            while not self.stop_event.is_set() and not self.live_ended_event.is_set():
+                if self.proc.poll() is not None:
+                    log("عملية FFmpeg انتهت (البث توقف من المصدر).")
+                    break
+                self.stop_event.wait(1)
 
+            self.stop_ffmpeg()
+            self.proc = None
+
+            if self.stop_event.is_set():
+                break
+
+            if self.live_ended_event.is_set():
+                self.stop_event.wait(LIVE_END_COOLDOWN)
+            elif time.time() - started < 10:
+                log("FFmpeg وقع بسرعة، استنى شوية قبل المحاولة.")
+                self.stop_event.wait(CRASH_DELAY)
             else:
-                log("البث مقفول حالياً... جاري الفحص مجدداً بعد 5 ثوانٍ.")
-                time.sleep(5)
+                self.stop_event.wait(RESTART_DELAY)
+
+        log("تم الإيقاف.")
 
 
 def main():
@@ -206,7 +246,7 @@ def main():
 
     def handler(sig, frame):
         restreamer.stop_event.set()
-        sys.exit(0)
+        restreamer.stop_ffmpeg()
 
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
